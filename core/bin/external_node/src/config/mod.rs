@@ -4,6 +4,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use url::Url;
 use zksync_basic_types::{Address, L1ChainId, L2ChainId};
+use zksync_config::ObjectStoreConfig;
 use zksync_consensus_roles::node;
 use zksync_core::{
     api_server::{
@@ -14,10 +15,12 @@ use zksync_core::{
 };
 use zksync_types::api::BridgeAddresses;
 use zksync_web3_decl::{
+    error::ClientRpcContext,
     jsonrpsee::http_client::{HttpClient, HttpClientBuilder},
     namespaces::{EthNamespaceClient, ZksNamespaceClient},
 };
 
+pub(crate) mod observability;
 #[cfg(test)]
 mod tests;
 
@@ -26,6 +29,7 @@ const BYTES_IN_MEGABYTE: usize = 1_024 * 1_024;
 /// This part of the external node config is fetched directly from the main node.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct RemoteENConfig {
+    pub bridgehub_proxy_addr: Option<Address>,
     pub diamond_proxy_addr: Address,
     pub l1_erc20_bridge_proxy_addr: Address,
     pub l2_erc20_bridge_addr: Address,
@@ -40,33 +44,26 @@ impl RemoteENConfig {
     pub async fn fetch(client: &HttpClient) -> anyhow::Result<Self> {
         let bridges = client
             .get_bridge_contracts()
-            .await
-            .context("Failed to fetch bridge contracts")?;
+            .rpc_context("get_bridge_contracts")
+            .await?;
         let l2_testnet_paymaster_addr = client
             .get_testnet_paymaster()
-            .await
-            .context("Failed to fetch paymaster")?;
+            .rpc_context("get_testnet_paymaster")
+            .await?;
+        // In case EN is connected to the old server version without `get_bridgehub_contract` method.
+        let bridgehub_proxy_addr = client.get_bridgehub_contract().await.ok().flatten();
         let diamond_proxy_addr = client
             .get_main_contract()
-            .await
-            .context("Failed to fetch L1 contract address")?;
-        let l2_chain_id = L2ChainId::try_from(
-            client
-                .chain_id()
-                .await
-                .context("Failed to fetch L2 chain ID")?
-                .as_u64(),
-        )
-        .unwrap();
-        let l1_chain_id = L1ChainId(
-            client
-                .l1_chain_id()
-                .await
-                .context("Failed to fetch L1 chain ID")?
-                .as_u64(),
-        );
+            .rpc_context("get_main_contract")
+            .await?;
+        let l2_chain_id = client.chain_id().rpc_context("chain_id").await?;
+        let l2_chain_id = L2ChainId::try_from(l2_chain_id.as_u64())
+            .map_err(|err| anyhow::anyhow!("invalid chain ID supplied by main node: {err}"))?;
+        let l1_chain_id = client.l1_chain_id().rpc_context("l1_chain_id").await?;
+        let l1_chain_id = L1ChainId(l1_chain_id.as_u64());
 
         Ok(Self {
+            bridgehub_proxy_addr,
             diamond_proxy_addr,
             l2_testnet_paymaster_addr,
             l1_erc20_bridge_proxy_addr: bridges.l1_erc20_default_bridge,
@@ -190,6 +187,12 @@ pub struct OptionalENConfig {
     /// Timeout to wait for the Merkle tree database to run compaction on stalled writes.
     #[serde(default = "OptionalENConfig::default_merkle_tree_stalled_writes_timeout_sec")]
     merkle_tree_stalled_writes_timeout_sec: u64,
+
+    // Postgres config (new parameters)
+    /// Threshold in milliseconds for the DB connection lifetime to denote it as long-living and log its details.
+    database_long_connection_threshold_ms: Option<u64>,
+    /// Threshold in milliseconds to denote a DB query as "slow" and log its details.
+    database_slow_query_threshold_ms: Option<u64>,
 
     // Other config settings
     /// Port on which the Prometheus exporter server is listening.
@@ -346,6 +349,16 @@ impl OptionalENConfig {
         Duration::from_secs(self.merkle_tree_stalled_writes_timeout_sec)
     }
 
+    pub fn long_connection_threshold(&self) -> Option<Duration> {
+        self.database_long_connection_threshold_ms
+            .map(Duration::from_millis)
+    }
+
+    pub fn slow_query_threshold(&self) -> Option<Duration> {
+        self.database_slow_query_threshold_ms
+            .map(Duration::from_millis)
+    }
+
     pub fn api_namespaces(&self) -> Vec<Namespace> {
         self.api_namespaces
             .clone()
@@ -416,10 +429,6 @@ impl PostgresConfig {
     }
 }
 
-fn read_operator_address() -> anyhow::Result<Address> {
-    Ok(std::env::var("EN_OPERATOR_ADDR")?.parse()?)
-}
-
 pub(crate) fn read_consensus_config() -> anyhow::Result<consensus::FetcherConfig> {
     let path = std::env::var("EN_CONSENSUS_CONFIG_PATH")
         .context("EN_CONSENSUS_CONFIG_PATH env variable is not set")?;
@@ -429,7 +438,22 @@ pub(crate) fn read_consensus_config() -> anyhow::Result<consensus::FetcherConfig
     let node_key: node::SecretKey = consensus::config::read_secret("EN_CONSENSUS_NODE_KEY")?;
     Ok(consensus::FetcherConfig {
         executor: cfg.executor_config(node_key),
-        operator_address: read_operator_address().context("read_operator_address()")?,
+    })
+}
+
+/// Configuration for snapshot recovery. Loaded optionally, only if the corresponding command-line argument
+/// is supplied to the EN binary.
+#[derive(Debug, Clone)]
+pub struct SnapshotsRecoveryConfig {
+    pub snapshots_object_store: ObjectStoreConfig,
+}
+
+pub(crate) fn read_snapshots_recovery_config() -> anyhow::Result<SnapshotsRecoveryConfig> {
+    let snapshots_object_store = envy::prefixed("EN_SNAPSHOTS_OBJECT_STORE_")
+        .from_env::<ObjectStoreConfig>()
+        .context("failed loading snapshot object store config from env variables")?;
+    Ok(SnapshotsRecoveryConfig {
+        snapshots_object_store,
     })
 }
 
@@ -538,6 +562,7 @@ impl From<ExternalNodeConfig> for InternalApiConfig {
                 l1_weth_bridge: config.remote.l1_weth_bridge_proxy_addr,
                 l2_weth_bridge: config.remote.l2_weth_bridge_addr,
             },
+            bridgehub_proxy_addr: config.remote.bridgehub_proxy_addr,
             diamond_proxy_addr: config.remote.diamond_proxy_addr,
             l2_testnet_paymaster_addr: config.remote.l2_testnet_paymaster_addr,
             req_entities_limit: config.optional.req_entities_limit,

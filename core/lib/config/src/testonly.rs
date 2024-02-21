@@ -363,6 +363,11 @@ impl RandomConfig for configs::ContractsConfig {
             fri_recursion_leaf_level_vk_hash: g.gen(),
             prover_at_genesis: g.gen(),
             snark_wrapper_vk_hash: g.gen(),
+            bridgehub_impl_addr: g.gen(),
+            bridgehub_proxy_addr: g.gen(),
+            state_transition_proxy_addr: g.gen(),
+            state_transition_impl_addr: g.gen(),
+            transparent_proxy_admin_addr: g.gen(),
         }
     }
 }
@@ -406,7 +411,10 @@ impl RandomConfig for configs::database::PostgresConfig {
             replica_url: g.gen(),
             prover_url: g.gen(),
             max_connections: g.gen(),
+            acquire_timeout_sec: g.gen(),
             statement_timeout_sec: g.gen(),
+            long_connection_threshold_ms: g.gen(),
+            slow_query_threshold_ms: g.gen(),
         }
     }
 }
@@ -633,10 +641,19 @@ impl RandomConfig for configs::house_keeper::HouseKeeperConfig {
 impl RandomConfig for configs::object_store::ObjectStoreMode {
     fn sample(g: &mut Gen<impl Rng>) -> Self {
         match g.rng.gen_range(0..4) {
-            0 => Self::GCS,
-            1 => Self::GCSWithCredentialFile,
-            2 => Self::FileBacked,
-            _ => Self::GCSAnonymousReadOnly,
+            0 => Self::GCS {
+                bucket_base_url: g.gen(),
+            },
+            1 => Self::GCSWithCredentialFile {
+                bucket_base_url: g.gen(),
+                gcs_credential_file_path: g.gen(),
+            },
+            2 => Self::FileBacked {
+                file_backed_base_path: g.gen(),
+            },
+            _ => Self::GCSAnonymousReadOnly {
+                bucket_base_url: g.gen(),
+            },
         }
     }
 }
@@ -644,10 +661,7 @@ impl RandomConfig for configs::object_store::ObjectStoreMode {
 impl RandomConfig for configs::ObjectStoreConfig {
     fn sample(g: &mut Gen<impl Rng>) -> Self {
         Self {
-            bucket_base_url: g.gen(),
             mode: g.gen(),
-            file_backed_base_path: g.gen(),
-            gcs_credential_file_path: g.gen(),
             max_retries: g.gen(),
         }
     }

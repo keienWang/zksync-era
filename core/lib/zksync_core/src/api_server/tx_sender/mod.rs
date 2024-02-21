@@ -25,6 +25,7 @@ use zksync_types::{
     MAX_NEW_FACTORY_DEPS, U256,
 };
 use zksync_utils::h256_to_u256;
+use zksync_web3_decl::jsonrpsee::http_client::HttpClient;
 
 pub(super) use self::{proxy::TxProxy, result::SubmitTxError};
 use crate::{
@@ -39,6 +40,7 @@ use crate::{
     fee_model::BatchFeeModelInputProvider,
     metrics::{TxStage, APP_METRICS},
     state_keeper::seal_criteria::{ConditionalSealer, NoopSealer, SealData},
+    utils::pending_protocol_version,
 };
 
 mod proxy;
@@ -163,8 +165,8 @@ impl TxSenderBuilder {
         self
     }
 
-    pub fn with_tx_proxy(mut self, main_node_url: &str) -> Self {
-        self.proxy = Some(TxProxy::new(main_node_url));
+    pub fn with_tx_proxy(mut self, client: HttpClient) -> Self {
+        self.proxy = Some(TxProxy::new(client));
         self
     }
 
@@ -350,7 +352,7 @@ impl TxSender {
             // We're running an external node: we have to proxy the transaction to the main node.
             // But before we do that, save the tx to cache in case someone will request it
             // Before it reaches the main node.
-            proxy.save_tx(tx.hash(), tx.clone()).await;
+            proxy.save_tx(tx.clone()).await;
             proxy.submit_tx(&tx).await?;
             // Now, after we are sure that the tx is on the main node, remove it from cache
             // since we don't want to store txs that might have been replaced or otherwise removed
@@ -375,8 +377,7 @@ impl TxSender {
             .as_ref()
             .unwrap() // Checked above
             .access_storage_tagged("api")
-            .await
-            .unwrap()
+            .await?
             .transactions_dal()
             .insert_transaction_l2(tx, execution_output.metrics)
             .await;
@@ -570,10 +571,9 @@ impl TxSender {
         let balance = self
             .acquire_replica_connection()
             .await?
-            .storage_dal()
-            .get_by_key(&eth_balance_key)
-            .await?
-            .unwrap_or_default();
+            .storage_web3_dal()
+            .get_value(&eth_balance_key)
+            .await?;
         Ok(h256_to_u256(balance))
     }
 
@@ -665,11 +665,9 @@ impl TxSender {
 
         let mut connection = self.acquire_replica_connection().await?;
         let block_args = BlockArgs::pending(&mut connection).await?;
-        let protocol_version = block_args
-            .resolve_block_info(&mut connection)
+        let protocol_version = pending_protocol_version(&mut connection)
             .await
-            .with_context(|| format!("failed resolving block info for {block_args:?}"))?
-            .protocol_version;
+            .context("failed getting pending protocol version")?;
         drop(connection);
 
         let fee_input = {
@@ -710,16 +708,15 @@ impl TxSender {
         let account_code_hash = self
             .acquire_replica_connection()
             .await?
-            .storage_dal()
-            .get_by_key(&hashed_key)
+            .storage_web3_dal()
+            .get_value(&hashed_key)
             .await
             .with_context(|| {
                 format!(
                     "failed getting code hash for account {:?}",
                     tx.initiator_account()
                 )
-            })?
-            .unwrap_or_default();
+            })?;
 
         if !tx.is_l1()
             && account_code_hash == H256::zero()
@@ -919,12 +916,9 @@ impl TxSender {
 
     pub async fn gas_price(&self) -> anyhow::Result<u64> {
         let mut connection = self.acquire_replica_connection().await?;
-        let block_args = BlockArgs::pending(&mut connection).await?;
-        let protocol_version = block_args
-            .resolve_block_info(&mut connection)
+        let protocol_version = pending_protocol_version(&mut connection)
             .await
-            .with_context(|| format!("failed resolving block info for {block_args:?}"))?
-            .protocol_version;
+            .context("failed obtaining pending protocol version")?;
         drop(connection);
 
         let (base_fee, _) = derive_base_fee_and_gas_per_pubdata(

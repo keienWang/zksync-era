@@ -81,6 +81,7 @@ pub struct InternalApiConfig {
     pub estimate_gas_scale_factor: f64,
     pub estimate_gas_acceptable_overestimation: u32,
     pub bridge_addresses: api::BridgeAddresses,
+    pub bridgehub_proxy_addr: Option<Address>,
     pub diamond_proxy_addr: Address,
     pub l2_testnet_paymaster_addr: Option<Address>,
     pub req_entities_limit: usize,
@@ -106,6 +107,7 @@ impl InternalApiConfig {
                 l1_weth_bridge: contracts_config.l1_weth_bridge_proxy_addr,
                 l2_weth_bridge: contracts_config.l2_weth_bridge_addr,
             },
+            bridgehub_proxy_addr: contracts_config.bridgehub_proxy_addr,
             diamond_proxy_addr: contracts_config.diamond_proxy_addr,
             l2_testnet_paymaster_addr: contracts_config.l2_testnet_paymaster_addr,
             req_entities_limit: web3_config.req_entities_limit(),
@@ -343,24 +345,27 @@ impl RpcState {
     ) -> Result<(), Web3Error> {
         const METHOD_NAME: &str = "set_nonce_for_call_request";
 
-        if call_request.nonce.is_none() {
-            let from = call_request.from.unwrap_or_default();
-            let block_id = api::BlockId::Number(api::BlockNumber::Latest);
-            let mut connection = self
-                .connection_pool
-                .access_storage_tagged("api")
-                .await
-                .unwrap();
-            let block_number = self
-                .resolve_block(&mut connection, block_id, METHOD_NAME)
-                .await?;
-            let address_historical_nonce = connection
-                .storage_web3_dal()
-                .get_address_historical_nonce(from, block_number)
-                .await
-                .map_err(|err| internal_error(METHOD_NAME, err))?;
-            call_request.nonce = Some(address_historical_nonce);
+        if call_request.nonce.is_some() {
+            return Ok(());
         }
+        let mut connection = self
+            .connection_pool
+            .access_storage_tagged("api")
+            .await
+            .map_err(|err| internal_error(METHOD_NAME, err))?;
+
+        let latest_block_id = api::BlockId::Number(api::BlockNumber::Latest);
+        let latest_block_number = self
+            .resolve_block(&mut connection, latest_block_id, METHOD_NAME)
+            .await?;
+
+        let from = call_request.from.unwrap_or_default();
+        let address_historical_nonce = connection
+            .storage_web3_dal()
+            .get_address_historical_nonce(from, latest_block_number)
+            .await
+            .map_err(|err| internal_error(METHOD_NAME, err))?;
+        call_request.nonce = Some(address_historical_nonce);
         Ok(())
     }
 }
